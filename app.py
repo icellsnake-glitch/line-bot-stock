@@ -16,18 +16,17 @@ if CHANNEL_ACCESS_TOKEN is None or CHANNEL_SECRET is None:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# 👉 首頁 GET 測試
+# ➜ 新增首頁測試路由
 @app.route("/", methods=['GET'])
 def home():
-    return "✅ LINE Bot is running on Render!"
+    return "Bot is running! 🚀"
 
-# 👉 LINE Webhook callback
 @app.route("/callback", methods=['POST'])
 def callback():
-    # 取得簽名
+    # 獲取簽名
     signature = request.headers['X-Line-Signature']
 
-    # 取得請求內容
+    # 獲取請求內容
     body = request.get_data(as_text=True)
 
     # 驗證簽名
@@ -38,7 +37,7 @@ def callback():
 
     return 'OK'
 
-# 👉 回覆訊息 (Echo Bot)
+# 回覆訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_bot_api.reply_message(
