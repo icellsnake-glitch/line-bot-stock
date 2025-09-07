@@ -1,43 +1,36 @@
 import os
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from flask import Flask, request, jsonify
+from linebot import LineBotApi
+from linebot.models import TextSendMessage
 
 app = Flask(__name__)
 
-# 讀取 Render 的環境變數
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+# 必填的三個環境變數（都是一行、不能有換行）
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()  # 你的 User ID（U 開頭）
+CRON_TOKEN = os.getenv("CRON_TOKEN", "change-me").strip()
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("Missing env: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
-
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 
 @app.get("/")
 def root():
     return "Bot is running! 🚀", 200
 
-@app.post("/callback")
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
+# 手動測試推播：瀏覽 https://你的域名/test-push?msg=hi
+@app.get("/test-push")
+def test_push():
+    msg = request.args.get("msg", "👋 測試推播成功！")
+    line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=msg))
+    return jsonify(ok=True, msg=msg), 200
 
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-
-    return "OK"
-
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=event.message.text)
-    )
+# 排程用的網址：Render 每天打這個網址就會推播
+@app.get("/cron")
+def cron():
+    if request.args.get("token") != CRON_TOKEN:
+        return jsonify(error="unauthorized"), 401
+    text = "🌅 早安！我是你的股市小幫手，之後這裡會放起漲清單～"
+    line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=text))
+    return jsonify(ok=True, pushed=True), 200
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
