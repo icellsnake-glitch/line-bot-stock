@@ -1,29 +1,27 @@
+import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import os
 
 app = Flask(__name__)
 
-# 從環境變數讀取 LINE Bot 的 token & secret
+# 從 Render 環境變數讀取
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# Render 測試首頁路由
-@app.route("/")
-def home():
-    return "LINE Bot is running!"
-
-# LINE Webhook callback
 @app.route("/callback", methods=['POST'])
 def callback():
+    # 獲取簽名
     signature = request.headers['X-Line-Signature']
+
+    # 獲取請求內容
     body = request.get_data(as_text=True)
 
+    # 驗證簽名
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
@@ -31,7 +29,7 @@ def callback():
 
     return 'OK'
 
-# 回覆文字訊息
+# 回覆訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_bot_api.reply_message(
@@ -40,5 +38,6 @@ def handle_message(event):
     )
 
 if __name__ == "__main__":
+    # Render 預設會給 PORT 環境變數
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
