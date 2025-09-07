@@ -6,41 +6,39 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# ✅ 從環境變數讀取（請到 Render > Settings > Environment 先設定）
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
+# 從環境變數讀取
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    # 若沒設好環境變數，啟動時就直接提示，避免之後才噴錯
-    raise RuntimeError("Missing env: CHANNEL_ACCESS_TOKEN or CHANNEL_SECRET")
+if CHANNEL_ACCESS_TOKEN is None or CHANNEL_SECRET is None:
+    raise RuntimeError("Missing env: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# 健康檢查（開根網址會看到 OK，方便確認服務有起來）
-@app.get("/")
-def health():
-    return "OK", 200
+# 👉 首頁 GET 測試
+@app.route("/", methods=['GET'])
+def home():
+    return "✅ LINE Bot is running on Render!"
 
-@app.route("/callback", methods=["POST"])
+# 👉 LINE Webhook callback
+@app.route("/callback", methods=['POST'])
 def callback():
-    # 取簽名；若 header 缺失，回 400
-    signature = request.headers.get("X-Line-Signature")
-    if not signature:
-        abort(400, description="Missing X-Line-Signature")
+    # 取得簽名
+    signature = request.headers['X-Line-Signature']
 
-    # 取請求內容（字串）
+    # 取得請求內容
     body = request.get_data(as_text=True)
 
-    # 驗證與處理事件
+    # 驗證簽名
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400, description="Invalid signature")
+        abort(400)
 
-    return "OK", 200
+    return 'OK'
 
-# 回覆文字訊息（echo）
+# 👉 回覆訊息 (Echo Bot)
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_bot_api.reply_message(
@@ -49,6 +47,5 @@ def handle_message(event):
     )
 
 if __name__ == "__main__":
-    # Render 會提供 PORT 環境變數
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
