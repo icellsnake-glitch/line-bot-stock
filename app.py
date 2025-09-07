@@ -16,6 +16,15 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 def root():
     return "Bot is running! 🚀", 200
 
+# 這裡填剛剛找到的 User ID
+USER_ID = "Uba635944620b9e471c0b850a0a836793"
+
+@app.route("/test-push")
+def test_push():
+    msg = request.args.get("msg", "Hello from Bot!")
+    line_bot_api.push_message(USER_ID, TextSendMessage(text=msg))
+    return "Message sent!"
+    
 # 手動測試推播：瀏覽 https://你的域名/test-push?msg=hi
 @app.get("/test-push")
 def test_push():
