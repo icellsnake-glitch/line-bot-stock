@@ -25,13 +25,6 @@ def test_push():
     line_bot_api.push_message(USER_ID, TextSendMessage(text=msg))
     return "Message sent!"
     
-# 手動測試推播：瀏覽 https://你的域名/test-push?msg=hi
-@app.get("/test-push")
-def test_push():
-    msg = request.args.get("msg", "👋 測試推播成功！")
-    line_bot_api.push_message(LINE_USER_ID, TextSendMessage(text=msg))
-    return jsonify(ok=True, msg=msg), 200
-
 # 排程用的網址：Render 每天打這個網址就會推播
 @app.get("/cron")
 def cron():
