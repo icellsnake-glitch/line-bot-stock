@@ -6,7 +6,7 @@ from linebot.models import TextSendMessage
 app = Flask(__name__)
 
 # 必填的三個環境變數（都是一行、不能有換行）
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").replace("\n", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()  # 你的 User ID（U 開頭）
 CRON_TOKEN = os.getenv("CRON_TOKEN", "change-me").strip()
 
