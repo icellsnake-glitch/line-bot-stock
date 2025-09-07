@@ -2,55 +2,51 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import yfinance as yf
 import os
 
 app = Flask(__name__)
 
-# 從環境變數讀取 LINE Token
-CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
+# 從環境變數讀取 LINE Bot 設定
+channel_secret = os.getenv("LINE_CHANNEL_SECRET")
+channel_access_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+default_user_id = os.getenv("LINE_USER_ID")
 
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+if channel_secret is None or channel_access_token is None:
+    raise Exception("請先在 Render 環境變數設定 LINE_CHANNEL_SECRET 與 LINE_CHANNEL_ACCESS_TOKEN")
 
-@app.route("/callback", methods=['POST'])
+line_bot_api = LineBotApi(channel_access_token)
+handler = WebhookHandler(channel_secret)
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    return "OK"
 
-    return 'OK'
-
-# 處理文字訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    text = event.message.text.strip()
-
-    # ✅ Ping 測試
-    if text.lower() == "ping":
-        reply_text = "pong ✅"
-
-    # ✅ 股票查詢 (輸入代號，例如: AAPL, TSLA, 2330.TW)
-    else:
-        ticker = text.upper()
-        try:
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="5d")
-            price = hist['Close'].iloc[-1]
-            reply_text = f"{ticker} 收盤價：{price:.2f}"
-        except:
-            reply_text = "查詢失敗，請輸入正確股票代號"
-
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text=reply_text)
+        TextSendMessage(text=f"你說了：{event.message.text}")
     )
 
+# 測試推播端點
+@app.route("/push", methods=["GET"])
+def push_message():
+    msg = request.args.get("msg", "Hello from Render!")
+    to = request.args.get("to", default_user_id)
+    if not to:
+        return "缺少目標 userId", 400
+    line_bot_api.push_message(to, TextSendMessage(text=msg))
+    return f"推播完成：{msg}", 200
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=5000)
