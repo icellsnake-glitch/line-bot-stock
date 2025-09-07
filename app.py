@@ -1,48 +1,52 @@
 import os
 from flask import Flask, request, abort
-
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
 app = Flask(__name__)
 
-# 從環境變數讀取（到 Render 的 Environment 內設定）
+# 從 Render 環境變數讀取
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+if CHANNEL_ACCESS_TOKEN is None or CHANNEL_SECRET is None:
     raise RuntimeError("Missing env: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# 健康檢查 / 首頁
-@app.get("/")
-def index():
+
+@app.route("/", methods=['GET'])
+def home():
     return "Bot is running! 🚀"
 
-# LINE Webhook 入口（只能 POST）
-@app.post("/callback")
+
+@app.route("/callback", methods=['POST'])
 def callback():
-    # 取得簽章
-    signature = request.headers.get("X-Line-Signature", "")
+    # 獲取簽名
+    signature = request.headers['X-Line-Signature']
+
+    # 獲取請求內容
     body = request.get_data(as_text=True)
 
+    # 驗證簽名
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
 
-    return "OK"
+    return 'OK'
 
-# 簡單 echo：回你傳來的文字
+
+# 回覆訊息
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=event.message.text)
     )
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
