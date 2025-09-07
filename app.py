@@ -28,11 +28,10 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        abort(400)  # 簽名驗證失敗
+        abort(400)
 
     return "OK"
 
-# 簡單 Echo：回你傳來的文字
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     line_bot_api.reply_message(
