@@ -7,8 +7,15 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 app = Flask(__name__)
 
 # 從 Render 環境變數讀取
-CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
+CHANNEL_ACCESS_TOKEN = os.getenv("IWMbWOthRWcoHk/PXDf8V9
+Op48XFk7UaB0BsXuFUdiMwh
+SJh75ULj4dreQY2hpJOSVCRS
++wj34MUZnw9WbX9qVhMz6
+D5lovXCUbNigGEOEJz3rd/A/v
+NkWjECvnvf8Ftrh/U9SQKc3Xb
+G44ZLNDtKQdB04t89/10/w1c
+DnyilFU=")
+CHANNEL_SECRET = os.getenv("2320caa4040a38e3c405d9c72d27eafc")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
