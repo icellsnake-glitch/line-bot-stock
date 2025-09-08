@@ -1,5 +1,4 @@
 Flask
-gunicorn
-line-bot-sdk>=3.0.0
-httpx
+line-bot-sdk
 requests
+gunicorn
