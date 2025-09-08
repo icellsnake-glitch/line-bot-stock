@@ -2,3 +2,4 @@ Flask
 gunicorn
 line-bot-sdk>=3.0.0
 httpx
+python-3.11.9
