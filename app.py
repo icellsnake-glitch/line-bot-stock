@@ -1,59 +1,48 @@
 import os
-import re
 import datetime as dt
 from typing import List, Tuple
 import requests
-from flask import Flask, request, abort
+from flask import Flask, request
 
-# -------------------------
-# Flask
-# -------------------------
 app = Flask(__name__)
 
-# -------------------------
-# 小工具：安全讀 env（延後到用到再讀）
-# -------------------------
-def env_str(key: str, default: str = "") -> str:
-    v = os.getenv(key, "").strip()
-    return v if v != "" else default
+# ========= 讀環境變數（安全且防空字串） =========
+def _f(name: str, default: float) -> float:
+    v = (os.getenv(name) or "").strip()
+    try:
+        return float(v) if v else default
+    except Exception:
+        return default
 
-def env_float(key: str, default: float) -> float:
-    v = os.getenv(key)
-    return float(v.strip()) if v and v.strip() != "" else default
+def _i(name: str, default: int) -> int:
+    v = (os.getenv(name) or "").strip()
+    try:
+        return int(v) if v else default
+    except Exception:
+        return default
 
-def env_int(key: str, default: int) -> int:
-    v = os.getenv(key)
-    return int(v.strip()) if v and v.strip() != "" else default
+LINE_TOKEN = (os.getenv("LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
+LINE_USER_ID = (os.getenv("LINE_USER_ID") or "").strip()
 
-# -------------------------
-# 參數（可用 Render Environment 覆蓋）
-# -------------------------
-MIN_CHANGE_PCT     = env_float("MIN_CHANGE_PCT", 2.0)        # 今日漲幅門檻（%）
-MIN_VOLUME         = env_int("MIN_VOLUME", 1_000_000)        # 今日量門檻（股）
-MAX_LINES_PER_MSG  = env_int("MAX_LINES_PER_MSG", 25)        # 每則訊息最多幾行
-MAX_CHARS_PER_MSG  = env_int("MAX_CHARS_PER_MSG", 1900)      # 每則訊息最多字數
+MIN_CHANGE_PCT = _f("MIN_CHANGE_PCT", 2.0)     # 漲幅門檻(%)，預設 2%
+MIN_VOLUME     = _i("MIN_VOLUME",   1_000_000) # 成交量門檻(股)，預設 100 萬
+MAX_LINES_PER_MSG = _i("MAX_LINES_PER_MSG", 25)
+MAX_CHARS_PER_MSG = _i("MAX_CHARS_PER_MSG", 1800)
 
-WATCHLIST_ENV      = env_str("WATCHLIST", "2330,2317,2454,2603,2882")
-LIST_SOURCES_ENV   = env_str("LIST_SOURCES", "")             # ALL 模式用，CSV/多來源以逗號分隔
+_default_watchlist = "2330,2317,2454,2303,2603,2882,2412,1303,1101,2377,3661,3481"
+WATCHLIST = (os.getenv("WATCHLIST") or _default_watchlist).strip()
 
-EMOJI_LISTED = env_str("EMOJI_LISTED", "📈")
-EMOJI_OTC    = env_str("EMOJI_OTC", "🚀")
-EMOJI_ETF    = env_str("EMOJI_ETF", "🧺")
-
-# -------------------------
-# Yahoo Finance 抓價量
-# -------------------------
+# ========= 小工具 =========
 def _yahoo_symbol(tw_code: str) -> str:
-    code = tw_code.strip().upper()
-    if code.endswith(".TW") or code.endswith(".TWO"):
-        return code
-    # 簡化：預設上市 .TW；若要上櫃可在 watchlist 直接寫 .TWO
-    return f"{code}.TW"
+    tw_code = tw_code.strip().upper()
+    if tw_code.endswith(".TW") or tw_code.endswith(".TWO"):
+        return tw_code
+    return f"{tw_code}.TW"
 
 def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
     """
-    回傳 (當日漲跌幅%, 當日成交量)
-    先嘗試 1d/1m，失敗退回 5d/1d。
+    回傳：(當日漲跌幅%, 當日成交量)
+    優先取 1d/1m 內盤；若拿不到，退 5d/1d。
     """
     symbol = _yahoo_symbol(tw_code)
     urls = [
@@ -71,13 +60,12 @@ def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
         result = j.get("chart", {}).get("result", [])
         if not result:
             continue
-
         indicators = result[0].get("indicators", {})
         quote = (indicators.get("quote") or [{}])[0]
         closes = quote.get("close") or []
         volumes = quote.get("volume") or []
 
-        # 取最後一筆有效
+        # 最後一筆有效價格/量
         for i in range(len(closes) - 1, -1, -1):
             c = closes[i]
             v = volumes[i] if i < len(volumes) else 0
@@ -86,7 +74,7 @@ def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
                 last_volume = int(v or 0)
                 break
 
-        # 前一筆當昨收
+        # 前一筆當作昨收
         for i in range(len(closes) - 2, -1, -1):
             c = closes[i]
             if c is not None:
@@ -96,178 +84,98 @@ def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
         if last_price is not None and last_close is not None:
             break
 
-    if last_price is None or last_close is None or last_close == 0:
+    if not last_price or not last_close:
         return 0.0, 0
 
-    chg = (last_price - last_close) / last_close * 100.0
-    return round(chg, 2), last_volume
+    change_pct = (last_price - last_close) / last_close * 100.0
+    return round(change_pct, 2), last_volume
 
-# -------------------------
-# 讀清單：支援 WATCHLIST=逗號 或 ALL+LIST_SOURCES
-# -------------------------
-CODE_RE = re.compile(r"^\s*([0-9]{4})(?:\.(TW|TWO))?\s*$")
+def chunks_by_limit(lines: List[str], max_lines: int, max_chars: int) -> List[str]:
+    """把多行切成多段，避免超過 LINE 訊息限制"""
+    pages, buf, chars = [], [], 0
+    for s in lines:
+        if (len(buf) + 1 > max_lines) or (chars + len(s) + 1 > max_chars):
+            pages.append("\n".join(buf))
+            buf, chars = [], 0
+        buf.append(s); chars += len(s) + 1
+    if buf:
+        pages.append("\n".join(buf))
+    return pages
 
-def parse_code(token: str) -> str | None:
-    """
-    合法代號（4碼，可選 .TW/.TWO），回傳規範化字串；否則 None
-    """
-    m = CODE_RE.match(token)
-    if not m:
-        return None
-    code, suffix = m.group(1), m.group(2)
-    if suffix:
-        return f"{code}.{suffix}"
-    return code  # 無尾碼者，掃描時會自動補 .TW
+def send_line_message(user_id: str, text: str) -> Tuple[int, str]:
+    """用 requests 直接打 LINE Push API（不需 line-bot-sdk）"""
+    if not LINE_TOKEN:
+        return 0, "Missing LINE_CHANNEL_ACCESS_TOKEN"
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {LINE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
+    return r.status_code, r.text
 
-def read_watchlist() -> List[str]:
-    wl = WATCHLIST_ENV.strip()
-    if wl.upper() != "ALL":
-        out = []
-        for t in wl.split(","):
-            norm = parse_code(t)
-            if norm:
-                out.append(norm)
-        return list(dict.fromkeys(out))  # 去重
-
-    # ALL 模式：從 LIST_SOURCES 蒐集（CSV / 純文字），多來源以逗號分隔
-    sources = [u.strip() for u in LIST_SOURCES_ENV.split(",") if u.strip()]
-    if not sources:
-        return []
-
-    codes: List[str] = []
-    for src in sources:
-        try:
-            if src.startswith("http"):
-                resp = requests.get(src, timeout=10)
-                resp.raise_for_status()
-                text = resp.text
-            else:
-                # 允許把清單直接貼到 env（多行文字）
-                text = src
-            # 抓每行第一欄（逗號/分隔），或直接掃 4 碼
-            for line in text.splitlines():
-                first = line.split(",")[0].strip()
-                token = parse_code(first) or parse_code(line.strip())
-                if token:
-                    codes.append(token)
-        except Exception:
-            continue
-
-    # 去重
-    codes = list(dict.fromkeys(codes))
-    return codes
-
-# -------------------------
-# 過濾＋排版
-# -------------------------
-def pick_rising_stocks(watchlist: List[str],
-                       min_change_pct: float,
-                       min_volume: int,
-                       top_k: int | None = None) -> List[tuple[str, float, int]]:
-    rows: List[tuple[str, float, int]] = []
-    for code in watchlist:
-        try:
-            chg, vol = fetch_change_pct_and_volume(code)
-            if chg >= min_change_pct and vol >= min_volume:
-                rows.append((code, chg, vol))
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return rows[:top_k] if top_k else rows
-
-def pretty_lines(rows: List[tuple[str, float, int]]) -> List[str]:
-    out = []
-    for i, (code, chg, vol) in enumerate(rows, 1):
-        # 判斷上市/上櫃/ETF（超簡化：用尾碼／代號 00 開頭等，你也可改成更嚴謹）
-        emoji = EMOJI_LISTED
-        u = code.upper()
-        if u.endswith(".TWO"):
-            emoji = EMOJI_OTC
-        if u.startswith("00") or u.startswith("008") or u.startswith("009"):
-            emoji = EMOJI_ETF
-        out.append(f"{i:>2}. {emoji} {code.replace('.TW','').replace('.TWO','')}  +{chg:.2f}%  量 {vol:,}")
-    return out
-
-def split_messages(lines: List[str]) -> List[str]:
-    msgs, cur = [], ""
-    for ln in lines:
-        # 超過字數或行數就換訊息
-        if (cur and (len(cur) + 1 + len(ln) > MAX_CHARS_PER_MSG)) or (cur.count("\n") + 1 >= MAX_LINES_PER_MSG):
-            msgs.append(cur)
-            cur = ""
-        cur = ln if not cur else (cur + "\n" + ln)
-    if cur:
-        msgs.append(cur)
-    return msgs
-
-# -------------------------
-# LINE 推播（延後載入，避免啟動時卡住）
-# -------------------------
-def get_line_clients():
-    access_token = env_str("LINE_CHANNEL_ACCESS_TOKEN")
-    channel_secret = env_str("LINE_CHANNEL_SECRET")
-    user_id = env_str("LINE_USER_ID")
-    if not access_token or not channel_secret or not user_id:
-        return None, None, None
-    try:
-        from linebot import LineBotApi, WebhookHandler
-        return LineBotApi(access_token), WebhookHandler(channel_secret), user_id
-    except Exception as e:
-        app.logger.exception(e)
-        return None, None, None
-
-def push_lines(msgs: List[str]) -> str:
-    line_bot_api, _, user_id = get_line_clients()
-    if not line_bot_api or not user_id:
-        return "LINE 環境變數未設定（LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / LINE_USER_ID）"
-    from linebot.models import TextSendMessage
-    for m in msgs:
-        line_bot_api.push_message(user_id, TextSendMessage(text=m))
-    return "OK"
-
-# -------------------------
-# 路由
-# -------------------------
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
-
+# ========= 路由 =========
 @app.get("/")
-def home():
-    return "Hello, I'm alive", 200
+def root():
+    return (
+        "✅ LINE Bot 股票推播服務啟動中\n"
+        "- 健康檢查 OK\n"
+        "- 手動推送請訪問：/daily-push\n"
+        "- 單純測試請訪問：/test-push?msg=Hello\n"
+    ), 200
+
+@app.get("/test-push")
+def test_push():
+    if not LINE_USER_ID:
+        return "Missing env: LINE_USER_ID", 500
+    msg = request.args.get("msg", "測試推播 OK")
+    code, text = send_line_message(LINE_USER_ID, msg)
+    return (f"Push sent! ({code})" if code == 200 else f"Push failed: {text}"), 200
 
 @app.get("/daily-push")
 def daily_push():
     try:
-        wl = read_watchlist()
-        if not wl:
-            return "清單為空：請設定 WATCHLIST（逗號清單），或 WATCHLIST=ALL 並提供 LIST_SOURCES", 200
+        if not LINE_USER_ID:
+            return "Missing env: LINE_USER_ID", 500
 
-        picked = pick_rising_stocks(
-            watchlist=wl,
-            min_change_pct=MIN_CHANGE_PCT,
-            min_volume=MIN_VOLUME
-        )
-        today = dt.datetime.now(tz=dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
+        # 解析 watchlist
+        codes = [c.strip() for c in WATCHLIST.split(",") if c.strip()]
+        rows = []
+        for c in codes:
+            try:
+                chg, vol = fetch_change_pct_and_volume(c)
+                rows.append((c, chg, vol))
+            except Exception:
+                # 單一代號出錯就略過
+                continue
+
+        picked = [r for r in rows if r[1] >= MIN_CHANGE_PCT and r[2] >= MIN_VOLUME]
+        picked.sort(key=lambda x: x[1], reverse=True)
+
+        tz8 = dt.timezone(dt.timedelta(hours=8))
+        today = dt.datetime.now(tz=tz8).strftime("%Y-%m-%d %H:%M")
+        header = f"【{today} 起漲清單】(漲幅≥{MIN_CHANGE_PCT}%, 量≥{MIN_VOLUME:,})"
         if not picked:
-            msgs = [f"【{today} 起漲清單】\n尚無符合條件（或市場未開/資料未更新）"]
+            pages = [header + "\n尚無符合條件的個股（或資料未更新）"]
         else:
-            lines = pretty_lines(picked)
-            header = f"【{today} 起漲清單】（門檻：漲≥{MIN_CHANGE_PCT}%、量≥{MIN_VOLUME:,}）"
-            lines = [header, ""] + lines
-            msgs = split_messages(lines)
+            body_lines = [f"{i+1}. {c}  漲幅 {chg:.2f}%  量 {vol:,}"
+                          for i, (c, chg, vol) in enumerate(picked)]
+            pages = chunks_by_limit([header, ""] + body_lines,
+                                    MAX_LINES_PER_MSG, MAX_CHARS_PER_MSG)
 
-        status = push_lines(msgs)
-        return (f"Push sent! ({status})", 200)
+        # 逐頁送出
+        ok = 0
+        for p in pages:
+            code, _ = send_line_message(LINE_USER_ID, p)
+            if code == 200:
+                ok += 1
+
+        return f"Sent {ok}/{len(pages)} page(s).", 200
     except Exception as e:
         app.logger.exception(e)
-        return (f"Error: {e}", 500)
-
-# （若你有 LINE webhook，可在下方加上 /callback，不影響上面三個路由）
-# @app.post("/callback")
-# def callback():
-#     ...
+        return str(e), 500
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
