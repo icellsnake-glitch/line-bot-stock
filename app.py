@@ -1,79 +1,92 @@
-import os
-from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import datetime as dt
+import requests
+from typing import List, Tuple
 
-app = Flask(__name__)
+# ---------- 工具：抓 Yahoo Finance 當日變化（不需金鑰） ----------
+def _yahoo_symbol(tw_code: str) -> str:
+    """把台股代號轉成 Yahoo Finance 代號：2330 -> 2330.TW"""
+    tw_code = tw_code.strip().upper()
+    if tw_code.endswith(".TW") or tw_code.endswith(".TWO"):
+        return tw_code
+    # 上市：.TW，上櫃：.TWO（你也可為上櫃個股手動指定）
+    return f"{tw_code}.TW"
 
-# ==== 環境變數（在 Render 的 Environment 介面設定）====
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET")
-USER_ID              = os.getenv("LINE_USER_ID")  # 你的個人 userId，用來 push
+def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
+    """
+    回傳：(當日漲跌幅%, 當日成交量)
+    使用 1d/1m 的 intraday 資料；若市場未開或拿不到，退回最近的日線。
+    """
+    symbol = _yahoo_symbol(tw_code)
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d",
+    ]
+    last_close = None
+    last_price = None
+    last_volume = 0
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("Missing env: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
-if not USER_ID:
-    app.logger.warning("WARN: Missing LINE_USER_ID (push 相關功能會失敗)")
+    for url in urls:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        j = r.json()
 
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+        result = j.get("chart", {}).get("result", [])
+        if not result:
+            continue
 
-# ---- 健康檢查 / 首頁 ----
-@app.get("/")
-def root():
-    return "Bot is running! 🚀", 200
+        indicators = result[0].get("indicators", {})
+        quote = (indicators.get("quote") or [{}])[0]
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
 
-# ---- Webhook 入口（LINE 平台會以 POST 打這個路由）----
-@app.post("/callback")
-def callback():
-    signature = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
+        # 取最後一筆有效值
+        for i in range(len(closes) - 1, -1, -1):
+            c = closes[i]
+            v = volumes[i] if i < len(volumes) else 0
+            if c is not None:
+                last_price = c
+                last_volume = int(v or 0)
+                break
 
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)  # 簽名錯誤 -> 400
-    return "OK"
+        # 取上一筆作為昨收
+        for i in range(len(closes) - 2, -1, -1):
+            c = closes[i]
+            if c is not None:
+                last_close = c
+                break
 
-# ---- Echo：把使用者文字原樣回覆 ----
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=event.message.text)
-    )
+        if last_price is not None and last_close is not None:
+            break
 
-# ---- 手動測試推播：GET /test-push?msg=Hello ----
-@app.get("/test-push")
-def test_push():
-    msg = request.args.get("msg", "Hello from Bot!")
-    try:
-        if not USER_ID:
-            return "Missing env: LINE_USER_ID", 500
-        line_bot_api.push_message(USER_ID, TextSendMessage(text=msg))
-        return f"Sent: {msg}", 200
-    except Exception as e:
-        app.logger.exception(e)
-        return str(e), 500
+    if last_price is None or last_close is None or last_close == 0:
+        # 拿不到資料時回 0,0，不入選
+        return 0.0, 0
 
-# ---- 每日清單推播：GET /daily-push（給外部排程打）----
-@app.get("/daily-push")
-def daily_push():
-    try:
-        if not USER_ID:
-            return "Missing env: LINE_USER_ID", 500
+    change_pct = (last_price - last_close) / last_close * 100.0
+    return round(change_pct, 2), last_volume
 
-        # 這裡放你的選股邏輯；先用假資料示範
-        rising_list = ["2330 台積電", "2454 聯發科", "2317 鴻海"]
-        message = "今日起漲清單：\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(rising_list))
+# ---------- 簡易「起漲」邏輯 ----------
+def pick_rising_stocks(watchlist: List[str],
+                       min_change_pct: float = 2.0,
+                       min_volume: int = 1_000_000,
+                       top_k: int = 10) -> List[str]:
+    """
+    以「漲幅 >= min_change_pct 且 成交量 >= min_volume」過濾，
+    依漲幅排序後取前 top_k。
+    """
+    rows = []
+    for code in watchlist:
+        try:
+            chg, vol = fetch_change_pct_and_volume(code)
+            rows.append((code, chg, vol))
+        except Exception:
+            # 單一代號失敗時略過；不中斷整體流程
+            continue
 
-        line_bot_api.push_message(USER_ID, TextSendMessage(text=message))
-        return "Daily push sent!", 200
-    except Exception as e:
-        app.logger.exception(e)
-        return str(e), 500
+    rows = [r for r in rows if r[1] >= min_change_pct and r[2] >= min_volume]
+    rows.sort(key=lambda x: x[1], reverse=True)
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    # 格式化輸出
+    pretty = [f"{i+1}. {code}  漲幅 {chg:.2f}%  量 {vol:,}"
+              for i, (code, chg, vol) in enumerate(rows[:top_k])]
+    return pretty
