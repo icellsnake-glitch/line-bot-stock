@@ -1,61 +1,165 @@
-# ===================== 參數（可用 Render 環境變數覆寫） =====================
+# app.py
 import os
 import re
-import datetime as dt
+import io
+import csv
+import hashlib
 import requests
-from typing import List, Tuple, Dict
-from bs4 import BeautifulSoup
-from linebot.models import TextSendMessage
+from datetime import datetime, time, timedelta, timezone
+from typing import List, Tuple
 
-# ----- 門檻（預設值你可改） -----
-MIN_CHANGE          = float(os.getenv("MIN_CHANGE_PCT", "2.0"))         # 起漲門檻：今漲幅 %
-MIN_VOLUME          = int(os.getenv("MIN_VOLUME", "1000000"))           # 今量（股）
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# 可選：前一日條件（預設不開）
-USE_YDAY_FILTER     = os.getenv("USE_YDAY_FILTER", "0") == "1"
-MIN_CHANGE_PRE      = float(os.getenv("MIN_CHANGE_PCT_PRE", "-1000"))   # 前一日漲幅下限
-MIN_VOLUME_PRE      = int(os.getenv("MIN_VOLUME_PRE", "0"))             # 前一日量下限
+# ================== Flask / LINE 基本設定 ==================
+app = Flask(__name__)
 
-# ----- 推播分段上限 -----
-MAX_LINES_PER_MSG   = int(os.getenv("MAX_LINES_PER_MSG", "18"))
-MAX_CHARS_PER_MSG   = int(os.getenv("MAX_CHARS_PER_MSG", "4500"))
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+CHANNEL_SECRET       = os.getenv("LINE_CHANNEL_SECRET", "").strip()
+USER_ID              = os.getenv("LINE_USER_ID", "").strip()
 
-# ----- 其他 -----
-TOP_K               = int(os.getenv("TOP_K", "50"))                     # 每一群最多取幾檔
-CRON_SECRET         = os.getenv("CRON_SECRET", "").strip()              # 若設了就要帶 ?secret= 才能觸發
-WATCHLIST_RAW       = os.getenv("WATCHLIST", "ALL").strip()             # ALL = 全市場
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise RuntimeError("Missing env: LINE_CHANNEL_ACCESS_TOKEN or LINE_CHANNEL_SECRET")
+
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler      = WebhookHandler(CHANNEL_SECRET)
+
+# ================== 參數與預設值（可用環境變數覆蓋） ==================
+WATCHLIST         = os.getenv("WATCHLIST", "ALL").strip()  # 'ALL' 或 '2330,2317,...'
+CRON_SECRET       = os.getenv("CRON_SECRET", "").strip()
+
+MIN_CHANGE_PCT    = float(os.getenv("MIN_CHANGE_PCT", "2.0"))
+MIN_VOLUME        = int(float(os.getenv("MIN_VOLUME", "1000000")))
+TOP_K             = int(os.getenv("TOP_K", "50"))
+
+MAX_LINES_PER_MSG = int(os.getenv("MAX_LINES_PER_MSG", "18"))
+MAX_CHARS_PER_MSG = int(os.getenv("MAX_CHARS_PER_MSG", "4500"))
+
+# 盤中交易時段控制（台北時間）
+MARKET_OPEN_STR   = os.getenv("MARKET_OPEN", "09:00")
+MARKET_CLOSE_STR  = os.getenv("MARKET_CLOSE", "13:30")
+TZ_NAME           = os.getenv("TZ", "Asia/Taipei")  # 簡化：一律用 UTC+8
+TZ8               = timezone(timedelta(hours=8))
+HOLIDAYS_RAW      = os.getenv("HOLIDAYS", "").strip()
+HOLIDAYS          = {h.strip() for h in HOLIDAYS_RAW.split(",") if h.strip()}
+
+# 收盤後「隔日觀察」門檻
+MIN_CHANGE_PCT_EOD = float(os.getenv("MIN_CHANGE_PCT_EOD", "1.5"))
+MIN_VOLUME_EOD     = int(float(os.getenv("MIN_VOLUME_EOD", "500000")))
+EOD_TIME_STR       = os.getenv("EOD_TIME", "14:10")  # 台北時間
 
 # Emoji（可換）
-EMOJI_LISTED        = os.getenv("EMOJI_LISTED", "🏦")
-EMOJI_OTC           = os.getenv("EMOJI_OTC", "🏬")
-EMOJI_ETF           = os.getenv("EMOJI_ETF", "📈")
+EMOJI_LISTED = os.getenv("EMOJI_LISTED", "📊")
+EMOJI_OTC    = os.getenv("EMOJI_OTC", "📈")
+EMOJI_ETF    = os.getenv("EMOJI_ETF", "📦")
 
-# ===================== 你已經有的工具：Yahoo 取價量 =====================
-def _yahoo_symbol(tw_code: str, market: str | None = None) -> str:
-    """
-    2330 + 市場 => 2330.TW / 2330.TWO
-    若 market 未提供，僅數字則預設 .TW
-    """
+# 去重狀態（盤中 / 收盤分開記錄）
+LAST_HASH     = {"date": None, "digest": None}
+LAST_HASH_EOD = {"date": None, "digest": None}
+
+# ================== 時間/工具 ==================
+def _tw_now():
+    return datetime.now(TZ8)
+
+def _parse_hhmm(s: str) -> time:
+    hh, mm = s.split(":")
+    return time(int(hh), int(mm))
+
+def is_trading_window() -> bool:
+    """僅在工作日、非假日、交易時間內回 True。"""
+    now = _tw_now()
+    dstr = now.strftime("%Y-%m-%d")
+    if dstr in HOLIDAYS:
+        return False
+    if now.weekday() > 4:  # 0~4 = Mon~Fri
+        return False
+    start = _parse_hhmm(MARKET_OPEN_STR)
+    end   = _parse_hhmm(MARKET_CLOSE_STR)
+    return start <= now.time() <= end
+
+def _calc_digest(lines: List[str]) -> str:
+    m = hashlib.md5()
+    for s in lines:
+        m.update(s.encode("utf-8"))
+        m.update(b"\n")
+    return m.hexdigest()
+
+def should_push(lines: List[str]) -> bool:
+    """盤中去重：同日相同內容不再推。"""
+    today  = _tw_now().strftime("%Y-%m-%d")
+    digest = _calc_digest(lines)
+    if LAST_HASH["date"] == today and LAST_HASH["digest"] == digest:
+        return False
+    LAST_HASH["date"]   = today
+    LAST_HASH["digest"] = digest
+    return True
+
+def should_push_eod(lines: List[str]) -> bool:
+    """收盤版去重：同日相同內容不再推。"""
+    today  = _tw_now().strftime("%Y-%m-%d")
+    digest = _calc_digest(lines)
+    if LAST_HASH_EOD["date"] == today and LAST_HASH_EOD["digest"] == digest:
+        return False
+    LAST_HASH_EOD["date"]   = today
+    LAST_HASH_EOD["digest"] = digest
+    return True
+
+def chunk_messages(lines: List[str]) -> List[str]:
+    """依行數/字數限制自動分頁。"""
+    msgs, buf = [], []
+    for line in lines:
+        candidate = ("\n".join(buf + [line])) if buf else line
+        if (len(buf) >= MAX_LINES_PER_MSG) or (len(candidate) > MAX_CHARS_PER_MSG):
+            msgs.append("\n".join(buf))
+            buf = [line]
+        else:
+            buf.append(line)
+    if buf:
+        msgs.append("\n".join(buf))
+    return msgs
+
+# ================== 市場/代號處理 ==================
+def classify_market(code: str) -> str:
+    """粗分：'上市' / '上櫃' / 'ETF'"""
+    cc = code.upper()
+    plain = cc.replace(".TW", "").replace(".TWO", "")
+    if cc.endswith(".TWO"):
+        return "上櫃"
+    # 簡式 ETF 規則：數字且 4~5 碼、且以 0 開頭（0050/00878...）
+    if plain.isdigit() and len(plain) in (4, 5) and plain.startswith("0"):
+        return "ETF"
+    return "上市"
+
+def label_with_market(code: str) -> Tuple[str, str]:
+    """(純代號, 市場)"""
+    if code.endswith(".TWO"):
+        return (code[:-4], "上櫃")
+    if code.endswith(".TW"):
+        return (code[:-3], "上市")
+    return (code, classify_market(code))
+
+# ================== 抓價量（Yahoo Finance） ==================
+def _yahoo_symbol(tw_code: str) -> str:
     tw_code = tw_code.strip().upper()
     if tw_code.endswith(".TW") or tw_code.endswith(".TWO"):
         return tw_code
-    if market == "上櫃":
-        return f"{tw_code}.TWO"
     return f"{tw_code}.TW"
 
-def fetch_change_pct_and_volume(symbol_or_code: str) -> Tuple[float, int, float, int]:
+def fetch_change_pct_and_volume(tw_code: str) -> Tuple[float, int]:
     """
-    回傳：(今日漲跌幅%, 今日量, 昨日漲跌幅%, 昨日量)
-    用 1d/1m 拿不到就退 5d/1d。
+    回傳：(當日漲跌幅%, 當日成交量)
+    先試 1d/1m，失敗退 5d/1d 的最後一根。
     """
-    # 若傳進來已含 .TW/.TWO 就直接用；否則預設 .TW
-    s = symbol_or_code if symbol_or_code.endswith((".TW", ".TWO")) else f"{symbol_or_code}.TW"
+    symbol = _yahoo_symbol(tw_code)
     urls = [
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{s}?range=1d&interval=1m",
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{s}?range=5d&interval=1d",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1m",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5d&interval=1d",
     ]
-    last_close = last_price = None
-    last_vol = y_close = y_price = y_vol = 0
+    last_close = None
+    last_price = None
+    last_volume = 0
 
     for url in urls:
         r = requests.get(url, timeout=12)
@@ -64,184 +168,321 @@ def fetch_change_pct_and_volume(symbol_or_code: str) -> Tuple[float, int, float,
         result = j.get("chart", {}).get("result", [])
         if not result:
             continue
-        quote = (result[0].get("indicators", {}).get("quote") or [{}])[0]
-        closes = quote.get("close") or []
-        vols   = quote.get("volume") or []
+        indicators = result[0].get("indicators", {})
+        quote = (indicators.get("quote") or [{}])[0]
+        closes  = quote.get("close") or []
+        volumes = quote.get("volume") or []
 
-        # 末筆當作今日
-        for i in range(len(closes)-1, -1, -1):
+        # 取最後有效值
+        for i in range(len(closes) - 1, -1, -1):
             c = closes[i]
-            v = vols[i] if i < len(vols) else 0
+            v = volumes[i] if i < len(volumes) else 0
             if c is not None:
-                last_price = c
-                last_vol = int(v or 0)
-                # 前一筆當作昨收
-                for j2 in range(i-1, -1, -1):
-                    if closes[j2] is not None:
-                        last_close = closes[j2]
-                        y_price = closes[j2]
-                        y_vol   = int(vols[j2] or 0) if j2 < len(vols) else 0
-                        # 再往前一筆作為「前一日的昨收」用來算昨日漲跌
-                        for k in range(j2-1, -1, -1):
-                            if closes[k] is not None:
-                                y_close = closes[k]
-                                break
-                        break
+                last_price  = c
+                last_volume = int(v or 0)
                 break
+
+        # 取昨收
+        for i in range(len(closes) - 2, -1, -1):
+            c = closes[i]
+            if c is not None:
+                last_close = c
+                break
+
         if last_price is not None and last_close is not None:
             break
 
     if not last_price or not last_close:
-        return 0.0, 0, 0.0, 0
+        return 0.0, 0
 
-    chg_today = round((last_price - last_close) / last_close * 100.0, 2)
-    chg_yday  = round(((y_price - y_close) / y_close * 100.0), 2) if (y_price and y_close) else 0.0
-    return chg_today, last_vol, chg_yday, y_vol
+    chg = (last_price - last_close) / last_close * 100.0
+    return round(chg, 2), int(last_volume)
 
-# ===================== 抓全市場代號 + 分群 =====================
-ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-
-def fetch_universe() -> List[Dict]:
+# ================== 全市場清單（WATCHLIST=ALL） ==================
+def load_watchlist() -> List[str]:
     """
-    讀證交所 ISIN 頁（BIG5），回：
-    [{code:'2330', name:'台積電', market:'上市', category:'股票'},
-     {code:'0050', name:'元大台灣50', market:'上市', category:'ETF'}, ...]
-    僅回「上市/上櫃」，其他市場忽略。
+    WATCHLIST:
+      - 'ALL'  → 自動抓全市場（上市 + 上櫃）
+      - '2330,2317,2454' → 逗號清單
+      - 代號可混 .TWO
     """
-    r = requests.get(ISIN_URL, timeout=20)
-    r.encoding = "big5"
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table")
-    if not table:
+    wl_env = WATCHLIST
+    if not wl_env:
         return []
-    rows = table.find_all("tr")[1:]  # 去掉表頭
-    out = []
-    for tr in rows:
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
-        if len(cols) < 6:
-            continue
-        code_name, _, _, market, category, _ = cols[:6]
-        if market not in ("上市", "上櫃"):
-            continue
-        m = re.match(r"^([0-9A-Z]+)", code_name)
-        if not m:
-            continue
-        code = m.group(1)
-        # 只收數字代號（一般股/ETF）；排除權證、債券等
-        if not re.match(r"^\d{3,5}$", code):
-            continue
-        out.append({"code": code, "market": market, "category": category})
-    return out
 
-def split_groups(universe: List[Dict]) -> Dict[str, List[Dict]]:
-    """依 類別 → 股票(上市)、股票(上櫃)、ETF 分群"""
-    listed = [x for x in universe if x["category"] == "股票" and x["market"] == "上市"]
-    otc    = [x for x in universe if x["category"] == "股票" and x["market"] == "上櫃"]
-    etf    = [x for x in universe if x["category"] == "ETF"]
-    return {"listed": listed, "otc": otc, "etf": etf}
+    if wl_env.upper() != "ALL":
+        return [c.strip() for c in wl_env.split(",") if c.strip()]
 
-# ===================== 篩選 + 格式化 + 分頁 =====================
-def pick_rising(block: List[Dict]) -> List[tuple]:
-    """
-    對某一群（上市/上櫃/ETF）的清單做篩選。
-    回 [(code, chg, vol, market), ...] 依漲幅大到小排序。
-    """
+    codes: List[str] = []
+
+    # 上市：TWSE ISIN 公開頁（HTML/TSV 混合，抓第一欄、前綴數字）
+    try:
+        r1 = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", timeout=20)
+        r1.encoding = "utf-8"  # 官方近年大多回 UTF-8；若遇到 Big5 也能自動解
+        for line in r1.text.splitlines():
+            # 以「\t」切，第一欄常見「2330　台積電」
+            cells = [c.strip() for c in line.split("\t") if c.strip()]
+            if not cells:
+                continue
+            head = cells[0]
+            # 代號在最前面，之後是全形空白 + 名稱
+            code = head.split(" ")[0].split("　")[0].strip()
+            if code.isdigit():
+                codes.append(code)  # 上市預設 .TW
+    except Exception as e:
+        app.logger.warning(f"抓上市清單失敗：{e}")
+
+    # 上櫃：TPEx JSON，代號需加 .TWO
+    try:
+        r2 = requests.get(
+            "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430.php?l=zh-tw",
+            timeout=20
+        )
+        j = r2.json()
+        for row in j.get("aaData", []):
+            code = str(row[0]).strip()
+            if code.isdigit():
+                codes.append(code + ".TWO")
+    except Exception as e:
+        app.logger.warning(f"抓上櫃清單失敗：{e}")
+
+    # 去重
+    seen, uniq = set(), []
+    for c in codes:
+        if c not in seen:
+            uniq.append(c)
+            seen.add(c)
+    return uniq
+
+# ================== 起漲挑選 ==================
+def pick_rising_stocks(watchlist: List[str],
+                       min_change_pct: float,
+                       min_volume: int,
+                       top_k: int) -> List[Tuple[str, float, int]]:
     rows = []
-    for it in block:
-        code, market = it["code"], it["market"]
-        sym = _yahoo_symbol(code, market)
+    for code in watchlist:
         try:
-            chg, vol, chg_pre, vol_pre = fetch_change_pct_and_volume(sym)
+            chg, vol = fetch_change_pct_and_volume(code)
+            if chg >= min_change_pct and vol >= min_volume:
+                rows.append((code, chg, vol))
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:top_k]
+
+# ================== 盤中：單次掃描（分群 + 分頁） ==================
+def run_intraday_once() -> Tuple[List[str], str]:
+    watchlist = load_watchlist()
+    if not watchlist:
+        return [], "Watchlist 為空（請設定 WATCHLIST）"
+
+    # 先掃描全部 → 蒐集 (code, chg, vol)
+    scanned = []
+    for code in watchlist:
+        try:
+            chg, vol = fetch_change_pct_and_volume(code)
+            scanned.append((code, chg, vol))
         except Exception:
             continue
 
-        if chg < MIN_CHANGE or vol < MIN_VOLUME:
+    # 分群 + 過濾
+    buckets = {"上市": [], "上櫃": [], "ETF": []}
+    for code, chg, vol in scanned:
+        group = classify_market(code)
+        if chg >= MIN_CHANGE_PCT and vol >= MIN_VOLUME:
+            buckets[group].append((code, chg, vol))
+
+    # 排序 + 取前 TOP_K
+    for k in buckets:
+        buckets[k].sort(key=lambda x: x[1], reverse=True)
+        buckets[k] = buckets[k][:TOP_K]
+
+    today = _tw_now().strftime("%Y-%m-%d")
+    segments_all: List[str] = []
+    any_hit = any(buckets[k] for k in buckets)
+    if not any_hit:
+        header = f"【{today} 起漲清單】目前無符合條件（或資料未更新）\n門檻：漲幅≥{MIN_CHANGE_PCT}%，量≥{MIN_VOLUME:,}"
+        return [header], "Empty picks"
+
+    def fmt_rows(rows):
+        out = []
+        for i, (code, chg, vol) in enumerate(rows, 1):
+            name, tag = label_with_market(code)
+            out.append(f"{i:>2}. {name:<6} ({tag})  漲幅 {chg:>6.2f}%  量 {vol:,}")
+        return out
+
+    for cat, icon in (("上市", EMOJI_LISTED), ("上櫃", EMOJI_OTC), ("ETF", EMOJI_ETF)):
+        rows = buckets[cat]
+        if not rows:
             continue
-        if USE_YDAY_FILTER and not (chg_pre >= MIN_CHANGE_PRE and vol_pre >= MIN_VOLUME_PRE):
+        title = (
+            f"【{today} 起漲清單】{icon} {cat}（{len(rows)} 檔）\n"
+            f"門檻：漲幅≥{MIN_CHANGE_PCT}%，量≥{MIN_VOLUME:,}"
+        )
+        pages = chunk_messages(fmt_rows(rows))
+        if pages:
+            pages[0] = title + "\n" + pages[0]
+        segments_all.extend(pages)
+
+    info = f"Listed:{len(buckets['上市'])}, OTC:{len(buckets['上櫃'])}, ETF:{len(buckets['ETF'])}"
+    return segments_all, info
+
+# ================== 收盤：單次掃描（隔日觀察） ==================
+def run_eod_once() -> Tuple[List[str], str]:
+    watchlist = load_watchlist()
+    if not watchlist:
+        return [], "Watchlist 為空（請設定 WATCHLIST）"
+
+    scanned = []
+    for code in watchlist:
+        try:
+            chg, vol = fetch_change_pct_and_volume(code)
+            scanned.append((code, chg, vol))
+        except Exception:
             continue
 
-        rows.append((code, chg, vol, market))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return rows[:TOP_K]
+    buckets = {"上市": [], "上櫃": [], "ETF": []}
+    for code, chg, vol in scanned:
+        group = classify_market(code)
+        if chg >= MIN_CHANGE_PCT_EOD and vol >= MIN_VOLUME_EOD:
+            buckets[group].append((code, chg, vol))
 
-def format_lines(rows: List[tuple]) -> List[str]:
-    """把 (code, chg, vol, market) 轉成可讀字串"""
-    pretty = []
-    for i, (code, chg, vol, market) in enumerate(rows, 1):
-        pretty.append(f"{i:>2}. {code:<5} 漲幅 {chg:>6.2f}%  量 {vol:,}")
-    return pretty
+    for k in buckets:
+        buckets[k].sort(key=lambda x: x[1], reverse=True)
+        buckets[k] = buckets[k][:TOP_K]
 
-def chunk_messages(title: str, lines: List[str]) -> List[str]:
-    """
-    依照 MAX_LINES_PER_MSG 與 MAX_CHARS_PER_MSG 把內容切成多段訊息。
-    """
-    pages = []
-    buf = title
-    cnt = 0
-    for ln in lines:
-        add = ("\n" if buf else "") + ln
-        if (cnt + 1 > MAX_LINES_PER_MSG) or (len(buf) + len(add) > MAX_CHARS_PER_MSG):
-            pages.append(buf)
-            buf = ln
-            cnt = 1
-        else:
-            buf += add
-            cnt += 1
-    if buf:
-        pages.append(buf)
-    return pages
+    today = _tw_now().strftime("%Y-%m-%d")
+    segments_all: List[str] = []
+    any_hit = any(buckets[k] for k in buckets)
+    if not any_hit:
+        header = (
+            f"【{today} 隔日觀察清單】目前無符合條件（或資料未更新）\n"
+            f"門檻：漲幅≥{MIN_CHANGE_PCT_EOD}%，量≥{MIN_VOLUME_EOD:,}"
+        )
+        return [header], "Empty picks"
 
-# ===================== 入口：/daily-push =====================
+    def fmt_rows(rows):
+        out = []
+        for i, (code, chg, vol) in enumerate(rows, 1):
+            name, tag = label_with_market(code)
+            out.append(f"{i:>2}. {name:<6} ({tag})  漲幅 {chg:>6.2f}%  量 {vol:,}")
+        return out
+
+    for cat, icon in (("上市", EMOJI_LISTED), ("上櫃", EMOJI_OTC), ("ETF", EMOJI_ETF)):
+        rows = buckets[cat]
+        if not rows:
+            continue
+        title = (
+            f"【{today} 隔日觀察清單】{icon} {cat}（{len(rows)} 檔）\n"
+            f"門檻：漲幅≥{MIN_CHANGE_PCT_EOD}%，量≥{MIN_VOLUME_EOD:,}"
+        )
+        pages = chunk_messages(fmt_rows(rows))
+        if pages:
+            pages[0] = title + "\n" + pages[0]
+        segments_all.extend(pages)
+
+    info = f"EOD Listed:{len(buckets['上市'])}, OTC:{len(buckets['上櫃'])}, ETF:{len(buckets['ETF'])}"
+    return segments_all, info
+
+# ================== 路由：健康檢查 / Webhook / 測試 ==================
+@app.get("/")
+def root():
+    return "Bot is running! 🚀", 200
+
+@app.post("/callback")
+def callback():
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return "OK"
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    # Echo
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=event.message.text))
+
+@app.get("/test-push")
+def test_push():
+    msg = request.args.get("msg", "Test")
+    try:
+        if not USER_ID:
+            return "Missing env: LINE_USER_ID", 500
+        line_bot_api.push_message(USER_ID, TextSendMessage(text=f"測試推播 OK：{msg}"))
+        return "OK", 200
+    except LineBotApiError as e:
+        app.logger.exception(e)
+        return str(e), 500
+
+# ================== 路由：手動即時掃描 ==================
 @app.get("/daily-push")
 def daily_push():
     try:
-        # 可選：簡單保護
-        if CRON_SECRET and request.args.get("secret") != CRON_SECRET:
-            return "Forbidden", 403
-        if not USER_ID:
-            return "Missing env: LINE_USER_ID", 500
-
-        # 1) 準備清單
-        universe: List[Dict]
-        manual_codes: List[str] = []
-        if WATCHLIST_RAW.upper() == "ALL":
-            universe = fetch_universe()
-        else:
-            # 逗號清單（可混合 .TWO），以「上市」預設；這樣仍會分群成「手動上市」
-            manual_codes = [x.strip().upper() for x in WATCHLIST_RAW.split(",") if x.strip()]
-            universe = [{"code": c.replace(".TW","").replace(".TWO",""), "market": "上市", "category": "股票"}
-                        for c in manual_codes]
-
-        groups = split_groups(universe)
-
-        # 2) 各群篩選
-        picked_listed = pick_rising(groups["listed"])
-        picked_otc    = pick_rising(groups["otc"])
-        picked_etf    = pick_rising(groups["etf"])
-
-        # 3) 各群組裝 + 分頁
-        today = dt.datetime.now(tz=dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
-        msgs: List[str] = []
-
-        if picked_listed:
-            title = f"【{today} 起漲清單】{EMOJI_LISTED} 上市（{len(picked_listed)} 檔）"
-            msgs += chunk_messages(title, format_lines(picked_listed))
-        if picked_otc:
-            title = f"【{today} 起漲清單】{EMOJI_OTC} 上櫃（{len(picked_otc)} 檔）"
-            msgs += chunk_messages(title, format_lines(picked_otc))
-        if picked_etf:
-            title = f"【{today} 起漲清單】{EMOJI_ETF} ETF（{len(picked_etf)} 檔）"
-            msgs += chunk_messages(title, format_lines(picked_etf))
-
-        if not msgs:
-            msgs = [f"【{today} 起漲清單】目前無符合條件（或資料未更新）\n"
-                    f"門檻：漲幅≥{MIN_CHANGE}%，量≥{MIN_VOLUME:,}"]
-
-        # 4) 逐段推播（LINE 每則訊息上限 5000 字，這裡保守用 4500）
-        for m in msgs:
-            line_bot_api.push_message(USER_ID, TextSendMessage(text=m))
-
-        return f"Sent {len(msgs)} message(s).", 200
+        segments, info = run_intraday_once()
+        if not segments:
+            return f"Skip ({info})", 204
+        # 標註時間
+        stamp = _tw_now().strftime("%H:%M")
+        segments[0] = segments[0] + f"\n⏱ 更新時間 {stamp}"
+        for seg in segments:
+            line_bot_api.push_message(USER_ID, TextSendMessage(text=seg))
+        return f"OK ({info})", 200
     except Exception as e:
         app.logger.exception(e)
         return str(e), 500
+
+# ================== 路由：每 30 分鐘（交易時段才推 + 去重 + 金鑰） ==================
+@app.get("/cron-scan-30m")
+def cron_scan_30m():
+    if CRON_SECRET and request.args.get("key") != CRON_SECRET:
+        return "Unauthorized", 401
+    if not is_trading_window():
+        return "Skip (off trading window)", 204
+    segments, info = run_intraday_once()
+    if not segments:
+        return f"Skip ({info})", 204
+    if not should_push(segments):
+        return "Skip (duplicate content)", 204
+    stamp = _tw_now().strftime("%H:%M")
+    segments[0] = segments[0] + f"\n⏱ 更新時間 {stamp}"
+    for seg in segments:
+        line_bot_api.push_message(USER_ID, TextSendMessage(text=seg))
+    return f"OK ({info})", 200
+
+# ================== 路由：收盤後隔日觀察（固定時點 + 去重 + 金鑰） ==================
+def _parse_eod_time(s: str) -> time:
+    hh, mm = s.split(":")
+    return time(int(hh), int(mm))
+
+@app.get("/cron-eod")
+def cron_eod():
+    if CRON_SECRET and request.args.get("key") != CRON_SECRET:
+        return "Unauthorized", 401
+
+    now = _tw_now()
+    dstr = now.strftime("%Y-%m-%d")
+    if dstr in HOLIDAYS or now.weekday() > 4:
+        return "Skip (holiday or weekend)", 204
+
+    target_t = _parse_eod_time(EOD_TIME_STR)
+    if now.time() < target_t:
+        return f"Skip (not yet {EOD_TIME_STR} TST)", 204
+
+    segments, info = run_eod_once()
+    if not segments:
+        return f"Skip ({info})", 204
+    if not should_push_eod(segments):
+        return "Skip (duplicate EOD content)", 204
+
+    stamp = now.strftime("%H:%M")
+    segments[0] = segments[0] + f"\n⏱ 產生時間 {stamp}"
+    for seg in segments:
+        line_bot_api.push_message(USER_ID, TextSendMessage(text=seg))
+    return f"OK ({info})", 200
+
+# ================== 本地開發用（Render 會用 gunicorn 啟動） ==================
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
