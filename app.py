@@ -90,3 +90,35 @@ def pick_rising_stocks(watchlist: List[str],
     pretty = [f"{i+1}. {code}  漲幅 {chg:.2f}%  量 {vol:,}"
               for i, (code, chg, vol) in enumerate(rows[:top_k])]
     return pretty
+    
+@app.get("/daily-push")
+def daily_push():
+    try:
+        if not USER_ID:
+            return "Missing env: LINE_USER_ID", 500
+
+        # 你的追蹤清單（先放常見權值與熱門股；之後你可改成讀檔或資料庫）
+        watchlist = [
+            "2330", "2454", "2317", "2303", "2603", "2882", "2412",
+            "1303", "1101", "5871", "1605", "2377", "3481", "3661",
+            # 上櫃請加 .TWO，例如「某些上櫃代號.TWO」
+        ]
+
+        picked = pick_rising_stocks(
+            watchlist=watchlist,
+            min_change_pct=2.0,     # 起漲門檻：漲幅 >= 2%
+            min_volume=1_000_000,   # 成交量門檻（股）
+            top_k=10
+        )
+
+        today = dt.datetime.now(tz=dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
+        if picked:
+            message = f"【{today} 起漲清單】\n" + "\n".join(picked)
+        else:
+            message = f"【{today} 起漲清單】\n尚無符合條件的個股（或資料未更新）"
+
+        line_bot_api.push_message(USER_ID, TextSendMessage(text=message))
+        return "Daily push sent!", 200
+    except Exception as e:
+        app.logger.exception(e)
+        return str(e), 500
