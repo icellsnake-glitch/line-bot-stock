@@ -41,7 +41,7 @@ MIN_VOLUME        = _get_int(  "MIN_VOLUME",        1_000_000) # 今日量 下�
 MAX_LINES_PER_MSG = _get_int(  "MAX_LINES_PER_MSG", 25)        # 每則訊息最多行數
 MAX_CHARS_PER_MSG = _get_int(  "MAX_CHARS_PER_MSG", 1900)      # 每則訊息最多字數(留點緩衝)
 
-WATCHLIST_MODE    = os.getenv("WATCHLIST", "ALL").strip().upper()
+WATCHLIST_MODE    = os.getenv("WATCHLIST", "2330,2317,2454,2603,2882").strip().upper()
 # 建議自己準備清單 CSV，第一欄是代號；多個來源用逗號分隔
 # 例如：LIST_SOURCES=https://your.site/listed.csv,https://your.site/otc.csv
 LIST_SOURCES      = [u.strip() for u in os.getenv("LIST_SOURCES", "").split(",") if u.strip()]
