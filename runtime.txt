@@ -1,4 +1,1 @@
-Flask
-gunicorn
-line-bot-sdk
-requests
+python-3.11.9
