@@ -3,4 +3,3 @@ gunicorn
 line-bot-sdk
 requests
 pytz
-schedule
